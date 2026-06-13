@@ -1,146 +1,73 @@
 # frozen_string_literal: true
 
 class ApplicationController < ActionController::Base
-  BROWSER_LOCALE_REGEXP = /\A\w{2}(?:-\w{2})?/
+  before_action :verify_proxy_source
+  before_action :verify_sso!
+  before_action :load_current_user
 
-  include ActiveStorage::SetCurrent
-  include Pagy::Method
-
-  check_authorization unless: :devise_controller?
-
-  around_action :with_locale
-  before_action :sign_in_for_demo, if: -> { Docuseal.demo? }
-  before_action :maybe_redirect_to_setup, unless: :signed_in?
-  before_action :authenticate_user!, unless: :devise_controller?
-
-  before_action :set_csp, if: -> { request.get? && !request.headers['HTTP_X_TURBO'] }
-
-  helper_method :button_title,
-                :current_account,
-                :true_ability,
-                :form_link_host,
-                :svg_icon
-
-  impersonates :user, with: ->(uuid) { User.find_by(uuid:) }
-
-  rescue_from Pagy::RangeError do
-    redirect_to request.path
-  end
-
-  rescue_from RateLimit::LimitApproached do |e|
-    Rollbar.error(e) if defined?(Rollbar)
-
-    redirect_to request.referer, alert: 'Too many requests', status: :too_many_requests
-  end
-
-  if Rails.env.production? || Rails.env.test?
-    rescue_from CanCan::AccessDenied do |e|
-      Rollbar.warning(e) if defined?(Rollbar)
-
-      redirect_to root_path, alert: e.message
-    end
-  end
-
-  def default_url_options
-    Docuseal.default_url_options
-  end
-
-  def impersonate_user(user)
-    raise ArgumentError unless user
-    raise Pretender::Error unless true_user
-
-    @impersonated_user = user
-
-    request.session[:impersonated_user_id] = user.uuid
-  end
-
-  def pagy_auto(collection, **keyword_args)
-    if current_ability.can?(:manage, :countless)
-      pagy(:countless, collection, **keyword_args)
-    else
-      pagy(collection, **keyword_args)
-    end
-  end
+  helper_method :current_user, :current_account
 
   private
 
-  def with_locale(&)
-    return yield unless current_account
+  # =========================
+  # 🔐 PROXY SECURITY
+  # =========================
+  def verify_proxy_source
+    return if Rails.env.development?
 
-    locale   = params[:lang].presence if Rails.env.development?
-    locale ||= current_account.locale
+    allowed_cidrs = [
+      IPAddr.new("172.18.0.0/16"),
+      IPAddr.new("127.0.0.1")
+    ]
 
-    I18n.with_locale(locale, &)
+    ip = IPAddr.new(request.remote_ip) rescue nil
+    return if ip && allowed_cidrs.any? { |net| net.include?(ip) }
+
+    render plain: "Forbidden (invalid proxy)", status: :forbidden
   end
 
-  def with_browser_locale(&)
-    return yield if I18n.locale != :'en-US' && I18n.locale != :en
+  # =========================
+  # 🔐 SSO HARD LOCK
+  # =========================
+  def verify_sso!
+    return if sso_email.present?
 
-    locale   = params[:lang].presence
-    locale ||= request.env['HTTP_ACCEPT_LANGUAGE'].to_s[BROWSER_LOCALE_REGEXP].to_s
-
-    locale =
-      if locale.starts_with?('en-') && locale != 'en-US'
-        'en-GB'
-      else
-        locale.split('-').first.presence || 'en-GB'
-      end
-
-    locale = 'en-GB' unless I18n.locale_available?(locale)
-
-    I18n.with_locale(locale, &)
+    render plain: "SSO REQUIRED", status: :unauthorized
   end
 
-  def sign_in_for_demo
-    sign_in(User.active.order('random()').take) unless signed_in?
+  # =========================
+  # 🔐 TRUSTED HEADERS ONLY
+  # =========================
+  def sso_email
+    request.headers["HTTP_X_AUTH_REQUEST_EMAIL"] ||
+      request.headers["HTTP_X_FORWARDED_EMAIL"]
   end
 
+  # =========================
+  # 👤 USER LOADING (NO AUTO CREATE)
+  # =========================
+  def load_current_user
+    email = sso_email&.downcase&.strip
+    return if email.blank?
+
+    @current_user = User.find_by(email: email)
+
+    return if @current_user
+
+    render plain: "User not provisioned", status: :forbidden
+  end
+
+  # =========================
+  # CURRENT USER
+  # =========================
+  def current_user
+    @current_user
+  end
+
+  # =========================
+  # ACCOUNT
+  # =========================
   def current_account
     current_user&.account
-  end
-
-  def true_ability
-    @true_ability ||= Ability.new(true_user)
-  end
-
-  def maybe_redirect_to_setup
-    redirect_to setup_index_path unless User.exists?
-  end
-
-  def button_title(title: I18n.t('submit'), disabled_with: I18n.t('submitting'), title_class: '', icon: nil,
-                   icon_disabled: nil)
-    render_to_string(partial: 'shared/button_title',
-                     locals: { title:, disabled_with:, title_class:, icon:, icon_disabled: })
-  end
-
-  def svg_icon(icon_name, class: '')
-    render_to_string(partial: "icons/#{icon_name}", locals: { class: })
-  end
-
-  def form_link_host
-    Docuseal.default_url_options[:host]
-  end
-
-  def maybe_redirect_com
-    return if request.domain != 'docuseal.co'
-
-    redirect_to request.url.gsub('.co/', '.com/'), allow_other_host: true, status: :moved_permanently
-  end
-
-  def set_csp
-    request.content_security_policy = current_content_security_policy.tap do |policy|
-      policy.default_src :self
-      policy.script_src :self
-      policy.style_src :self, :unsafe_inline
-      policy.img_src :self, :https, :http, :blob, :data
-      policy.font_src :self, :https, :http, :blob, :data
-      policy.manifest_src :self
-      policy.media_src :self
-      policy.frame_src :self
-      policy.worker_src :self, :blob
-      policy.connect_src :self
-
-      policy.directives['connect-src'] << 'ws:' if Rails.env.development?
-    end
   end
 end
